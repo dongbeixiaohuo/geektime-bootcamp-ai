@@ -196,4 +196,4 @@ Now add a section "学习资料" after "实战项目", and help me port mdx docs
 
 ## 构建 cursor 的完整的学习资料
 
-帮我撰写一个 ./site/src/pages/materials/cursor-intro.md 文件，内容为 cursor 的完整的学习资料，包括 cursor 的架构，设计，组件，流程等，使用 mermaid 绘制架构，设计，组件，流程等图表并详细说明。然后再介绍 cursor 的 rules 和 agent 的用法。
+深度思考，查阅网上资料，帮我撰写一个 ./site/src/pages/materials/cursor-intro.mdx 文件，内容为 cursor 的完整的学习资料，包括 cursor 的架构，设计，组件，流程等，使用 mermaid 绘制架构，设计，组件，流程等图表并详细说明。然后再介绍 cursor 的 rules 和 agent 的用法。

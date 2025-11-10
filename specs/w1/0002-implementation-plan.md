@@ -3093,7 +3093,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
 ### 后端设置
 
-\`\`\`bash
+```bash
 cd backend
 
 # 使用 uv 安装依赖
@@ -3109,11 +3109,11 @@ uv run alembic upgrade head
 
 # 启动开发服务器
 uv run uvicorn app.main:app --reload --port 8000
-\`\`\`
+```
 
 ### 前端设置
 
-\`\`\`bash
+```bash
 cd frontend
 
 # 安装依赖
@@ -3121,13 +3121,13 @@ yarn
 
 # 启动开发服务器
 yarn dev
-\`\`\`
+```
 
 访问 http://localhost:5173 查看应用。
 
 ## 项目结构
 
-\`\`\`
+```
 project-alpha/
 ├── backend/          # FastAPI 后端
 │   ├── app/
@@ -3142,7 +3142,7 @@ project-alpha/
 │       ├── store/       # 状态管理
 │       └── types/       # TypeScript 类型
 └── docs/           # 文档
-\`\`\`
+```
 
 ## API 文档
 
@@ -3154,7 +3154,7 @@ project-alpha/
 
 ### 后端开发
 
-\`\`\`bash
+```bash
 # 运行测试
 uv run pytest
 
@@ -3164,11 +3164,11 @@ uv run isort app/
 
 # 类型检查
 uv run mypy app/
-\`\`\`
+```
 
 ### 前端开发
 
-\`\`\`bash
+```bash
 # 构建
 yarn build
 
@@ -3177,7 +3177,7 @@ yarn preview
 
 # 代码检查
 yarn lint
-\`\`\`
+```
 
 ## 许可证
 

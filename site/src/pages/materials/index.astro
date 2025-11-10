@@ -1,64 +1,52 @@
 ---
-import PageLayout from '../../layouts/PageLayout.astro';
-import PageHeader from '../../components/ui/PageHeader';
-import ScrollReveal from '../../components/ui/ScrollReveal';
-import { BookOpen, Code, Wrench, Lightbulb, FileText } from 'lucide-react';
+import PageLayout from "../../layouts/PageLayout.astro";
+import PageHeader from "../../components/ui/PageHeader";
+import ScrollReveal from "../../components/ui/ScrollReveal";
+import { BookOpen, Code, Wrench, Lightbulb, FileText } from "lucide-react";
 
 const materials = [
   {
-    category: '工具深度解析',
+    category: "工具深度解析",
     icon: Wrench,
-    description: '深入了解 AI 编程工具的架构和使用',
+    description: "深入了解 AI 编程工具的架构和使用",
     items: [
       {
-        title: 'Claude Code 2.0 深度架构分析',
-        description: '完整逆向工程分析，16个System Prompts，50+架构图',
-        href: '/materials/claude-code-architecture',
-        tags: ['Claude Code', '架构', '高级'],
+        title: "Claude Code 2.0 深度架构分析",
+        description: "完整逆向工程分析，16个System Prompts，50+架构图",
+        href: "/materials/claude-code-architecture",
+        tags: ["Claude Code", "架构", "高级"],
       },
       {
-        title: 'Claude Code 安装配置指南',
-        description: '从零开始配置 Claude Code，最佳实践和技巧',
-        href: '/materials/claude-code-setup',
-        tags: ['Claude Code', '入门', '配置'],
+        title: "Claude Code 安装配置指南",
+        description: "从零开始配置 Claude Code，最佳实践和技巧",
+        href: "/materials/claude-code-setup",
+        tags: ["Claude Code", "入门", "配置"],
       },
       {
-        title: 'NotebookLM 完全指南',
-        description: '1M上下文窗口，闪卡、测验、思维导图全功能',
-        href: '/materials/notebooklm-guide',
-        tags: ['NotebookLM', '知识管理', '学习'],
+        title: "NotebookLM 完全指南",
+        description: "1M上下文窗口，闪卡、测验、思维导图全功能",
+        href: "/materials/notebooklm-guide",
+        tags: ["NotebookLM", "知识管理", "学习"],
+      },
+      {
+        title: "Cursor 2.0 完全学习指南",
+        description: "架构设计深度剖析，Rules 和 Agent 实战指南，50+ Mermaid 图表",
+        href: "/materials/cursor-intro",
+        tags: ["Cursor", "架构", "Agent", "高级"],
       },
     ],
   },
+
   {
-    category: '工具对比分析',
-    icon: Code,
-    description: '全面对比各类 AI 工具，帮你做出最佳选择',
-    items: [
-      {
-        title: 'AI 编码工具全景对比',
-        description: 'Cursor vs Claude Code vs Copilot 深度对比',
-        href: '/materials/ai-coding-tools-comparison',
-        tags: ['对比', 'Cursor', 'Claude Code'],
-      },
-      {
-        title: 'AI 模型能力对比',
-        description: 'Claude vs GPT vs Gemini 规格、性能、价格全方位对比',
-        href: '/materials/ai-models-comparison',
-        tags: ['对比', 'Claude', 'GPT', 'Gemini'],
-      },
-    ],
-  },
-  {
-    category: '概念与理论',
+    category: "概念与理论",
     icon: Lightbulb,
-    description: 'AI 辅助编程的核心概念和理论基础',
+    description: "AI 辅助编程的核心概念和理论基础",
     items: [],
   },
   {
-    category: '实战案例',
+    category: "实战案例",
     icon: FileText,
-    description: '真实项目的开发过程和经验分享',
+    description: "真实项目的开发过程和经验分享",
     items: [],
   },
 ];
@@ -115,7 +103,9 @@ const materials = [
                         <h4 class="text-xl font-bold text-primary mb-2 group-hover:text-accent transition-colors">
                           {item.title}
                         </h4>
-                        <p class="text-text-secondary mb-4">{item.description}</p>
+                        <p class="text-text-secondary mb-4">
+                          {item.description}
+                        </p>
                         <div class="flex flex-wrap gap-2">
                           {item.tags.map((tag) => (
                             <span class="px-3 py-1 bg-bg-secondary text-xs font-medium rounded-full">
