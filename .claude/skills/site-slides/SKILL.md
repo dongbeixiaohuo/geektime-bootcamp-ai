@@ -53,7 +53,12 @@ If directory contains only a PDF file:
 
    This generates `001.jpg`, `002.jpg`, etc.
 
-4. Proceed to Step 4.
+4. Delete the original PDF file after successful conversion:
+   ```bash
+   rm ./site/public/slides/<directory-name>/<filename>.pdf
+   ```
+
+5. Proceed to Step 4.
 
 ### Step 4: Generate Slides MDX File
 

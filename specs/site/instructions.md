@@ -256,4 +256,4 @@ based on @w3/extracted/system-prompts.json and @w3/extracted/tool-definitions.js
 
 ## 添加 max to page button
 
-for presentations in ./site, please update the component to add a button to make it full in the current browser. We have full screen mode but at some point we just want to take all space of the browser tab. Please implement that.
+for presentations in ./site, please update the component to add a button to make it full in the current browser. We have full clscreen mode but at some point we just want to take all space of the browser tab. Please implement that.
