@@ -348,7 +348,11 @@ async def query(
     # Execute query through orchestrator
     try:
         response: QueryResponse = await _orchestrator.execute_query(request)
-        return response.to_dict()
+        result = response.to_dict()
+        # Ensure tokens_used is always present
+        if "tokens_used" not in result:
+            result["tokens_used"] = 0
+        return result
     except Exception as e:
         logger.exception("Unexpected error in query tool")
         return {
@@ -358,6 +362,7 @@ async def query(
                 "message": f"Internal server error: {e!s}",
                 "details": {"error_type": type(e).__name__},
             },
+            "tokens_used": 0,
         }
 
 
