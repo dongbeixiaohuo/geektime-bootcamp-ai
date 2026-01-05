@@ -533,11 +533,30 @@ No differences found between current branch and main.
 
 ### Tool Errors
 
-If a git or gh command fails:
+When a tool call fails, **analyze the error and try alternative approaches** before giving up:
 
-1. Report the error clearly to the user
-2. Suggest alternatives if possible (e.g., "Branch 'main' not found. Try 'master'?")
-3. Ask for clarification if needed
+**Git command failures:**
+- Branch not found → Try alternative branch names (main/master/develop)
+- Invalid revision → Verify commit hash with `git log --oneline`
+- Permission denied → Report to user, this is a system issue
+
+**File read failures:**
+- File not found → This is often expected:
+  - AGENTS.md files don't exist in most repos (this is fine, move on)
+  - Files in diff may be deleted (check diff headers for `deleted file`)
+  - Don't repeatedly try the same missing file
+- Use `git ls-files` to verify if a file exists in the repo
+
+**Error recovery strategy:**
+1. Analyze the error message to understand the cause
+2. If it's a path/branch issue, try alternatives silently
+3. If it's a missing optional file (like AGENTS.md), skip and continue
+4. Only report errors to user if they block the review
+
+**Do NOT:**
+- Keep retrying the same failed command
+- Report every "file not found" for optional files like AGENTS.md
+- Ask user for help with recoverable errors
 
 ### Large Diffs
 
@@ -561,11 +580,16 @@ If the user's request is unclear:
 
 ### File Not Found
 
-If `read_file` fails for a file mentioned in the diff:
+**For files in the diff:**
+1. Check if it's a deletion (diff header shows `deleted file mode`)
+2. Check if it's a rename (diff header shows `rename from`/`rename to`)
+3. Use `git ls-files <path>` to verify existence
+4. Continue reviewing other files
 
-1. The file may have been deleted — this is expected for deletion diffs
-2. Check if it's a rename by looking at the diff headers
-3. Continue reviewing other files
+**For convention files (AGENTS.md, .editorconfig, etc.):**
+- These are optional — most repos don't have them
+- Try once at repo root, don't search exhaustively
+- Silently skip if not found, don't report as error
 
 ---
 
