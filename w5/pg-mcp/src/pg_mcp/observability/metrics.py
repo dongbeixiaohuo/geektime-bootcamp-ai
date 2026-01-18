@@ -175,6 +175,14 @@ class MetricsCollector:
         """
         self.db_query_duration.observe(duration)
 
+    def observe_query_duration(self, duration: float) -> None:
+        """Record query request processing duration.
+
+        Args:
+            duration: Duration in seconds.
+        """
+        self.query_duration.observe(duration)
+
     def set_schema_cache_age(self, database: str, age_seconds: float) -> None:
         """Set schema cache age.
 

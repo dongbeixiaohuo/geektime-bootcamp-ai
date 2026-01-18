@@ -18,6 +18,7 @@ from pg_mcp.db.pool import close_pools, create_pool
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
+from pg_mcp.observability.tracing import request_context
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.orchestrator import QueryOrchestrator
@@ -71,23 +72,48 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
     global _settings, _pools, _schema_cache, _orchestrator, _metrics
     global _circuit_breaker, _rate_limiter
 
+    # Setup emergency logging before anything else
+    import logging
+    import sys
+    from pathlib import Path
+
+    emergency_log = Path.cwd() / "mcp_server_startup.log"
+    emergency_handler = logging.FileHandler(emergency_log, encoding="utf-8", mode="w")
+    emergency_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logging.getLogger().addHandler(emergency_handler)
+    logging.getLogger().setLevel(logging.DEBUG)
+
     logger.info("Starting PostgreSQL MCP Server initialization...")
-    
+    logger.info(f"Emergency log: {emergency_log}")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Working directory: {Path.cwd()}")
+
     try:
         # 1. Load Settings
         logger.info("Loading configuration...")
-        _settings = Settings()
+        try:
+            _settings = Settings()
+            logger.info("Settings loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}", exc_info=True)
+            raise
 
         # 2. Configure logging
         logger.info("Configuring logging...")
-        configure_logging(
-            level=_settings.observability.log_level,
-            log_format=_settings.observability.log_format,
-            enable_sensitive_filter=True,
-        )
-        
+        try:
+            configure_logging(
+                level=_settings.observability.log_level,
+                log_format=_settings.observability.log_format,
+                enable_sensitive_filter=True,
+            )
+            logger.info("Logging configured")
+        except Exception as e:
+            logger.error(f"Failed to configure logging: {e}", exc_info=True)
+            raise
+
         # Force file logging for debugging (Re-add after configure_logging cleared it)
-        import logging
         file_handler = logging.FileHandler("mcp_debug.log", encoding='utf-8')
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         logging.getLogger().addHandler(file_handler)
@@ -104,16 +130,47 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # 3. Create database connection pools
         logger.info("Creating database connection pools...")
         _pools = {}
-        # Note: For single database configuration, we use the main database config
-        pool = await create_pool(_settings.database)
-        _pools[_settings.database.name] = pool
+
+        # Import os for environment variable access
+        import os
+        from pg_mcp.config.settings import DatabaseConfig
+
+        # Primary database (from DATABASE_* env vars)
+        db1_config = DatabaseConfig(
+            host=os.getenv("DATABASE_HOST", "localhost"),
+            port=int(os.getenv("DATABASE_PORT", "5432")),
+            name=os.getenv("DATABASE_NAME", "postgres"),
+            user=os.getenv("DATABASE_USER", "postgres"),
+            password=os.getenv("DATABASE_PASSWORD", ""),
+        )
+        pool1 = await create_pool(db1_config)
+        _pools[db1_config.name] = pool1
         logger.info(
-            f"Created connection pool for database '{_settings.database.name}'",
+            f"Created connection pool for database '{db1_config.name}'",
             extra={
-                "min_size": _settings.database.min_pool_size,
-                "max_size": _settings.database.max_pool_size,
+                "min_size": db1_config.min_pool_size,
+                "max_size": db1_config.max_pool_size,
             },
         )
+
+        # Second database (from DATABASE2_* env vars, if configured)
+        if os.getenv("DATABASE2_NAME"):
+            db2_config = DatabaseConfig(
+                host=os.getenv("DATABASE2_HOST", os.getenv("DATABASE_HOST", "localhost")),
+                port=int(os.getenv("DATABASE2_PORT", os.getenv("DATABASE_PORT", "5432"))),
+                name=os.getenv("DATABASE2_NAME"),
+                user=os.getenv("DATABASE2_USER", os.getenv("DATABASE_USER", "postgres")),
+                password=os.getenv("DATABASE2_PASSWORD", os.getenv("DATABASE_PASSWORD", "")),
+            )
+            pool2 = await create_pool(db2_config)
+            _pools[db2_config.name] = pool2
+            logger.info(
+                f"Created connection pool for database '{db2_config.name}'",
+                extra={
+                    "min_size": db2_config.min_pool_size,
+                    "max_size": db2_config.max_pool_size,
+                },
+            )
 
         # 4. Load Schema cache
         logger.info("Initializing schema cache...")
@@ -161,9 +218,9 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # SQL Validator
         sql_validator = SQLValidator(
             config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
+            blocked_tables=_settings.security.blocked_tables,
+            blocked_columns=_settings.security.blocked_columns,
+            explain_policy=_settings.security.explain_policy,
         )
 
         # SQL Executor (create one per database)
@@ -173,6 +230,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
                 pool=pool,
                 security_config=_settings.security,
                 db_config=_settings.database,
+                metrics=_metrics,
             )
             sql_executors[db_name] = executor
             logger.info(f"Created SQL executor for database '{db_name}'")
@@ -203,12 +261,14 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
             sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            sql_executors=sql_executors,
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
+            rate_limiter=_rate_limiter,
+            metrics=_metrics,
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
@@ -223,6 +283,25 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
 
         # Yield to run the server
         yield
+
+    except Exception as e:
+        logger.exception("Fatal error during server initialization")
+        # Also write to emergency log
+        import traceback
+        error_detail = f"FATAL ERROR: {e}\n{traceback.format_exc()}"
+        logger.error(error_detail)
+
+        # Write to separate error file
+        try:
+            from pathlib import Path
+            error_file = Path.cwd() / "mcp_fatal_error.log"
+            with open(error_file, "w", encoding="utf-8") as f:
+                f.write(error_detail)
+            logger.error(f"Error details written to {error_file}")
+        except Exception:
+            pass
+
+        raise e
 
     finally:
         # Shutdown sequence
@@ -346,11 +425,23 @@ async def query(
 
     # Build request
     try:
-        request = QueryRequest(
-            question=question,
-            database=database,
-            return_type=ReturnType(return_type),
-        )
+        async with request_context() as request_id:
+            # Note: request_id is implicitly available via context, but we can also pass it explicitly
+            # if we add it to QueryRequest model. For now, orchestrator gets it from context.
+            request = QueryRequest(
+                question=question,
+                database=database,
+                return_type=ReturnType(return_type),
+            )
+            # Inject request_id if QueryRequest supports it (dynamic check)
+            if hasattr(request, "request_id"):
+                setattr(request, "request_id", request_id)
+
+            # Execute query through orchestrator
+            response: QueryResponse = await _orchestrator.execute_query(request)
+            result = response.to_dict()
+            return result
+
     except Exception as e:
         return {
             "success": False,
@@ -359,26 +450,6 @@ async def query(
                 "message": f"Invalid request parameters: {e!s}",
                 "details": {"error": str(e)},
             },
-        }
-
-    # Execute query through orchestrator
-    try:
-        response: QueryResponse = await _orchestrator.execute_query(request)
-        result = response.to_dict()
-        # Ensure tokens_used is always present
-        if "tokens_used" not in result:
-            result["tokens_used"] = 0
-        return result
-    except Exception as e:
-        logger.exception("Unexpected error in query tool")
-        return {
-            "success": False,
-            "error": {
-                "code": "INTERNAL_ERROR",
-                "message": f"Internal server error: {e!s}",
-                "details": {"error_type": type(e).__name__},
-            },
-            "tokens_used": 0,
         }
 
 

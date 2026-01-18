@@ -5,12 +5,13 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
+from enum import StrEnum
 from typing import Literal
 
 import os
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,8 +30,8 @@ def _load_env_from_dotenv() -> None:
         key = key.strip()
         value = value.strip()
         
-        # Load DATABASE_ and OPENAI_ variables if not present in os.environ
-        if (key.startswith("OPENAI_") or key.startswith("DATABASE_")) and key not in os.environ:
+        # Load DATABASE_, DATABASE2_, and OPENAI_ variables if not present in os.environ
+        if (key.startswith("OPENAI_") or key.startswith("DATABASE")) and key not in os.environ:
             os.environ[key] = value
 
 
@@ -100,13 +101,27 @@ class OpenAIConfig(BaseSettings):
         return v
 
 
+class ExplainPolicy(StrEnum):
+    """Policy for EXPLAIN statement execution."""
+
+    DISABLED = "disabled"  # Reject all EXPLAIN statements
+    EXPLAIN_ONLY = "explain_only"  # Allow EXPLAIN but reject EXPLAIN ANALYZE
+    ENABLED = "enabled"  # Allow all EXPLAIN statements
+
+
 class SecurityConfig(BaseSettings):
     """Security and access control configuration."""
 
     model_config = SettingsConfigDict(env_prefix="SECURITY_")
 
-    allow_write_operations: bool = Field(
-        default=False, description="Allow write operations (INSERT, UPDATE, DELETE)"
+    blocked_tables: list[str] = Field(
+        default_factory=list, description="List of tables to block access to"
+    )
+    blocked_columns: list[str] = Field(
+        default_factory=list, description="List of columns to block access to (format: table.column or column)"
+    )
+    explain_policy: ExplainPolicy = Field(
+        default=ExplainPolicy.DISABLED, description="Policy for EXPLAIN statements"
     )
     blocked_functions: list[str] = Field(
         default_factory=lambda: [
@@ -115,6 +130,8 @@ class SecurityConfig(BaseSettings):
             "pg_write_file",
             "lo_import",
             "lo_export",
+            "dblink",
+            "pg_terminate_backend",
         ],
         description="List of blocked PostgreSQL functions",
     )
@@ -226,12 +243,31 @@ class Settings(BaseSettings):
 
     # Nested configurations
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    databases: list[DatabaseConfig] = Field(
+        default_factory=list, description="List of database configurations"
+    )
+    default_database: str | None = Field(
+        default=None, description="Name of the default database"
+    )
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    @model_validator(mode="after")
+    def ensure_databases(self) -> "Settings":
+        """Ensure databases list is populated and default database is set."""
+        # If no databases configured but single database is, use it
+        if not self.databases and self.database:
+            self.databases = [self.database]
+
+        # If only one database and no default set, make it default
+        if not self.default_database and len(self.databases) == 1:
+            self.default_database = self.databases[0].name
+
+        return self
 
     @property
     def is_production(self) -> bool:

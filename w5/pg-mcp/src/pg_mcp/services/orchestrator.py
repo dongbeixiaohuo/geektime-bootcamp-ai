@@ -6,6 +6,7 @@ validation. It implements retry logic, error handling, and request tracking.
 """
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -18,6 +19,7 @@ from pg_mcp.models.errors import (
     ErrorCode,
     LLMError,
     PgMcpError,
+    RateLimitExceededError,
     SchemaLoadError,
     SecurityViolationError,
     SQLParseError,
@@ -30,13 +32,16 @@ from pg_mcp.models.query import (
     ReturnType,
     ValidationResult,
 )
+from pg_mcp.observability.metrics import MetricsCollector
+from pg_mcp.observability.tracing import TracingLogger, get_request_id
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker
+from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.result_validator import ResultValidator
 from pg_mcp.services.sql_executor import SQLExecutor
 from pg_mcp.services.sql_generator import SQLGenerator
 from pg_mcp.services.sql_validator import SQLValidator
 
-logger = logging.getLogger(__name__)
+logger = TracingLogger(__name__)
 
 
 class QueryOrchestrator:
@@ -50,7 +55,7 @@ class QueryOrchestrator:
         >>> orchestrator = QueryOrchestrator(
         ...     sql_generator=generator,
         ...     sql_validator=validator,
-        ...     sql_executor=executor,
+        ...     sql_executors={"mydb": executor},
         ...     result_validator=result_validator,
         ...     schema_cache=cache,
         ...     pools={"mydb": pool},
@@ -67,33 +72,39 @@ class QueryOrchestrator:
         self,
         sql_generator: SQLGenerator,
         sql_validator: SQLValidator,
-        sql_executor: SQLExecutor,
+        sql_executors: dict[str, SQLExecutor],
         result_validator: ResultValidator,
         schema_cache: SchemaCache,
         pools: dict[str, Pool],
         resilience_config: ResilienceConfig,
         validation_config: ValidationConfig,
+        rate_limiter: MultiRateLimiter | None = None,
+        metrics: MetricsCollector | None = None,
     ) -> None:
         """Initialize query orchestrator.
 
         Args:
             sql_generator: SQL generation service.
             sql_validator: SQL validation service.
-            sql_executor: SQL execution service.
+            sql_executors: Dictionary mapping database names to SQL executors.
             result_validator: Result validation service.
             schema_cache: Schema cache instance.
             pools: Dictionary mapping database names to connection pools.
             resilience_config: Resilience configuration for retries and circuit breaker.
             validation_config: Validation configuration including thresholds.
+            rate_limiter: Optional rate limiter.
+            metrics: Optional metrics collector.
         """
         self.sql_generator = sql_generator
         self.sql_validator = sql_validator
-        self.sql_executor = sql_executor
+        self.sql_executors = sql_executors
         self.result_validator = result_validator
         self.schema_cache = schema_cache
         self.pools = pools
         self.resilience_config = resilience_config
         self.validation_config = validation_config
+        self.rate_limiter = rate_limiter
+        self.metrics = metrics
 
         # Create circuit breaker for LLM calls
         self.circuit_breaker = CircuitBreaker(
@@ -127,11 +138,16 @@ class QueryOrchestrator:
             ...     print(f"Found {response.data.row_count} rows")
         """
         # Generate request_id for full-chain tracing
-        request_id = str(uuid.uuid4())
+        request_id = getattr(request, "request_id", None) or get_request_id() or str(uuid.uuid4())
+        
         logger.info(
             "Starting query execution",
             extra={"request_id": request_id, "question": request.question[:100]},
         )
+        
+        start_time = self._get_current_time_ms()
+        if self.metrics:
+            self.metrics.increment_query_request(status="started", database=request.database or "default")
 
         try:
             # Step 1: Resolve database name
@@ -181,6 +197,10 @@ class QueryOrchestrator:
                     "Returning SQL only",
                     extra={"request_id": request_id, "sql_length": len(generated_sql)},
                 )
+                if self.metrics:
+                    self.metrics.observe_query_duration((self._get_current_time_ms() - start_time) / 1000.0)
+                    self.metrics.increment_query_request(status="success", database=database_name)
+
                 return QueryResponse(
                     success=True,
                     generated_sql=generated_sql,
@@ -193,11 +213,28 @@ class QueryOrchestrator:
 
             # Step 5: Execute SQL
             logger.debug("Executing SQL", extra={"request_id": request_id})
-            start_time = self._get_current_time_ms()
+            execution_start_time = self._get_current_time_ms()
+            
+            # Select executor for the database
+            executor = self.sql_executors.get(database_name)
+            if not executor:
+                raise DatabaseError(
+                    message=f"No SQL executor available for database '{database_name}'",
+                    details={"database": database_name},
+                )
 
-            results, total_count = await self.sql_executor.execute(generated_sql)
+            # Execute with rate limiting
+            if self.rate_limiter:
+                try:
+                    async with self.rate_limiter.for_queries():
+                        results, total_count = await executor.execute(generated_sql)
+                except RateLimitExceededError as e:
+                     # Re-raise as our error type if it isn't already (it is)
+                     raise
+            else:
+                results, total_count = await executor.execute(generated_sql)
 
-            execution_time_ms = self._get_current_time_ms() - start_time
+            execution_time_ms = self._get_current_time_ms() - execution_start_time
             logger.info(
                 "SQL executed successfully",
                 extra={
@@ -223,6 +260,10 @@ class QueryOrchestrator:
                 row_count=len(results),  # Limited row count (after max_rows applied)
                 execution_time_ms=execution_time_ms,
             )
+            
+            if self.metrics:
+                self.metrics.observe_query_duration((self._get_current_time_ms() - start_time) / 1000.0)
+                self.metrics.increment_query_request(status="success", database=database_name)
 
             return QueryResponse(
                 success=True,
@@ -234,7 +275,35 @@ class QueryOrchestrator:
                 tokens_used=tokens_used,
             )
 
+        except SecurityViolationError as e:
+            if self.metrics:
+                self.metrics.increment_sql_rejected(reason=str(e))
+                self.metrics.increment_query_request(status="security_violation", database=request.database or "unknown")
+            # Handle known application errors
+            logger.warning(
+                "Query execution failed with security violation",
+                extra={
+                    "request_id": request_id,
+                    "error_code": e.code,
+                    "error_message": str(e),
+                },
+            )
+            return QueryResponse(
+                success=False,
+                generated_sql=None,
+                validation=None,
+                data=None,
+                error=ErrorDetail(
+                    code=e.code.value,
+                    message=e.message,
+                    details=e.details,
+                ),
+                confidence=0,
+                tokens_used=None,
+            )
         except PgMcpError as e:
+            if self.metrics:
+                self.metrics.increment_query_request(status="error", database=request.database or "unknown")
             # Handle known application errors
             logger.warning(
                 "Query execution failed with known error",
@@ -258,6 +327,8 @@ class QueryOrchestrator:
                 tokens_used=None,
             )
         except Exception as e:
+            if self.metrics:
+                self.metrics.increment_query_request(status="error", database=request.database or "unknown")
             # Handle unexpected errors
             logger.exception(
                 "Query execution failed with unexpected error",
@@ -386,12 +457,31 @@ class QueryOrchestrator:
                 )
 
                 # Generate SQL
-                generated_sql = await self.sql_generator.generate(
-                    question=question,
-                    schema=schema,
-                    previous_attempt=previous_sql,
-                    error_feedback=error_feedback,
-                )
+                llm_start_time = self._get_current_time_ms()
+                
+                # Apply rate limiting for LLM
+                if self.rate_limiter:
+                    async with self.rate_limiter.for_llm():
+                        generated_sql = await self.sql_generator.generate(
+                            question=question,
+                            schema=schema,
+                            previous_attempt=previous_sql,
+                            error_feedback=error_feedback,
+                        )
+                else:
+                    generated_sql = await self.sql_generator.generate(
+                        question=question,
+                        schema=schema,
+                        previous_attempt=previous_sql,
+                        error_feedback=error_feedback,
+                    )
+                
+                if self.metrics:
+                    self.metrics.increment_llm_call(operation="generate_sql")
+                    self.metrics.observe_llm_latency(operation="generate_sql", duration=(self._get_current_time_ms() - llm_start_time) / 1000.0)
+                    # Note: tokens_used would come from OpenAI response metadata if available
+                    # if tokens_used:
+                    #     self.metrics.observe_tokens_used(tokens_used)
 
                 # Note: tokens_used would come from OpenAI response metadata if available
                 # For now, we don't extract it, but it can be added later

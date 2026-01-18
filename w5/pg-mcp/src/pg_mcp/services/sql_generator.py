@@ -4,9 +4,12 @@ This module provides the SQLGenerator class that uses OpenAI's LLM to convert
 natural language questions into valid PostgreSQL SQL queries.
 """
 
+import asyncio
+import logging
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import httpx
 from openai import AsyncOpenAI
 
 from pg_mcp.config.settings import OpenAIConfig
@@ -17,6 +20,8 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletion
 
     from pg_mcp.models.schema import DatabaseSchema
+
+logger = logging.getLogger(__name__)
 
 
 class SQLGenerator:
@@ -42,17 +47,128 @@ class SQLGenerator:
             config: OpenAI configuration including API key and model settings.
         """
         self.config = config
+        self.use_custom_api = config.base_url is not None
+
         if config.base_url:
+            # Use httpx for custom endpoints to avoid SDK parsing issues
+            self.http_client = httpx.AsyncClient(timeout=config.timeout)
+
+            # Build API endpoint, avoiding duplicate /v1 if already present
+            base = config.base_url.rstrip('/')
+            if base.endswith('/v1'):
+                self.api_endpoint = f"{base}/chat/completions"
+            else:
+                self.api_endpoint = f"{base}/v1/chat/completions"
+
+            logger.info(f"Using custom API endpoint via httpx: {self.api_endpoint}")
+            # Still create OpenAI client as fallback
             self.client = AsyncOpenAI(
                 api_key=config.api_key.get_secret_value(),
                 timeout=config.timeout,
                 base_url=config.base_url,
             )
         else:
+            self.http_client = None
+            self.api_endpoint = None
             self.client = AsyncOpenAI(
                 api_key=config.api_key.get_secret_value(),
                 timeout=config.timeout,
             )
+
+    async def _call_custom_api(self, messages: list[dict[str, str]]) -> str:
+        """Call custom API endpoint directly using httpx.
+
+        This bypasses OpenAI SDK's response parsing which may fail with custom endpoints.
+
+        Args:
+            messages: List of chat messages
+
+        Returns:
+            Response content as string
+
+        Raises:
+            LLMError: If API call fails
+            LLMTimeoutError: If request times out
+        """
+        if not self.http_client or not self.api_endpoint:
+            raise LLMError(
+                message="Custom API not configured",
+                details={}
+            )
+
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key.get_secret_value()}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            logger.debug(f"Calling custom API: {self.api_endpoint}")
+            response = await self.http_client.post(
+                self.api_endpoint,
+                json=payload,
+                headers=headers,
+            )
+
+            logger.debug(f"Custom API response status: {response.status_code}")
+
+            if response.status_code != 200:
+                raise LLMError(
+                    message=f"Custom API returned status {response.status_code}",
+                    details={"status_code": response.status_code, "response": response.text[:500]},
+                )
+
+            # Try to parse as JSON
+            try:
+                data = response.json()
+                logger.debug(f"Parsed JSON response, type: {type(data)}")
+
+                # Handle standard OpenAI format
+                if isinstance(data, dict) and "choices" in data:
+                    content = data["choices"][0]["message"]["content"]
+                    logger.debug("Extracted content from OpenAI-format response")
+                    return content
+
+                # Handle direct string response
+                if isinstance(data, str):
+                    logger.debug("Direct string response from API")
+                    return data
+
+                # Handle other dict formats
+                if isinstance(data, dict):
+                    # Try common content fields
+                    for key in ["content", "text", "result", "output"]:
+                        if key in data:
+                            logger.debug(f"Extracted content from field: {key}")
+                            return str(data[key])
+
+                logger.error(f"Unexpected JSON structure: {data}")
+                raise LLMError(
+                    message="Unexpected response structure from custom API",
+                    details={"response_type": str(type(data)), "response": str(data)[:500]},
+                )
+
+            except Exception as json_err:
+                # If JSON parsing fails, try raw text
+                logger.warning(f"JSON parsing failed: {json_err}, using raw text")
+                return response.text
+
+        except httpx.TimeoutException as e:
+            raise LLMTimeoutError(
+                message=f"Custom API request timed out after {self.config.timeout}s",
+                details={"timeout": self.config.timeout},
+            ) from e
+        except httpx.HTTPError as e:
+            raise LLMError(
+                message=f"HTTP error calling custom API: {e}",
+                details={"error": str(e)},
+            ) from e
 
     async def generate(
         self,
@@ -105,52 +221,61 @@ class SQLGenerator:
             error_feedback=error_feedback,
         )
 
-        try:
-            response: ChatCompletion = await self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": SQL_GENERATION_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-            )
-        except TimeoutError as e:
-            raise LLMTimeoutError(
-                message=f"OpenAI API request timed out after {self.config.timeout}s",
-                details={"timeout": self.config.timeout},
-            ) from e
-        except Exception as e:
-            # Handle various OpenAI errors
-            error_msg = str(e)
-            if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API authentication failed - check API key",
+        messages = [
+            {"role": "system", "content": SQL_GENERATION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # Use custom API method if configured, otherwise use OpenAI SDK
+        if self.use_custom_api:
+            logger.debug("Using custom API via httpx")
+            content = await self._call_custom_api(messages)
+        else:
+            logger.debug("Using standard OpenAI SDK")
+            try:
+                response: ChatCompletion = await self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                )
+            except TimeoutError as e:
+                raise LLMTimeoutError(
+                    message=f"OpenAI API request timed out after {self.config.timeout}s",
+                    details={"timeout": self.config.timeout},
+                ) from e
+            except Exception as e:
+                # Handle various OpenAI errors
+                error_msg = str(e)
+                if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
+                    raise LLMUnavailableError(
+                        message="OpenAI API authentication failed - check API key",
+                        details={"error": error_msg},
+                    ) from e
+                if "rate_limit" in error_msg.lower():
+                    raise LLMUnavailableError(
+                        message="OpenAI API rate limit exceeded",
+                        details={"error": error_msg},
+                    ) from e
+                raise LLMError(
+                    message=f"OpenAI API request failed: {error_msg}",
                     details={"error": error_msg},
                 ) from e
-            if "rate_limit" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API rate limit exceeded",
-                    details={"error": error_msg},
-                ) from e
-            raise LLMError(
-                message=f"OpenAI API request failed: {error_msg}",
-                details={"error": error_msg},
-            ) from e
 
-        # Extract SQL from response
-        if not response.choices:
-            raise LLMError(
-                message="OpenAI returned empty response",
-                details={"response": response.model_dump()},
-            )
+            # Extract content from standard OpenAI response
+            if not response.choices:
+                raise LLMError(
+                    message="OpenAI returned empty response",
+                    details={"response": response.model_dump()},
+                )
 
-        content = response.choices[0].message.content
-        if not content:
-            raise LLMError(
-                message="OpenAI returned empty message content",
-                details={"response": response.model_dump()},
-            )
+            content = response.choices[0].message.content
+            if not content:
+                raise LLMError(
+                    message="OpenAI returned empty message content",
+                    details={"response": response.model_dump()},
+                )
+
 
         sql = self._extract_sql(content)
         if not sql:

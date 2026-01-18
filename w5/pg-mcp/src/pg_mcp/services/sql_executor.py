@@ -7,6 +7,7 @@ result serialization, and row limiting to prevent memory overflow.
 import asyncio
 import datetime
 import decimal
+import logging
 import uuid
 from typing import Any
 
@@ -15,6 +16,10 @@ from asyncpg import Connection, Pool
 
 from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
+from pg_mcp.observability.metrics import MetricsCollector
+from pg_mcp.observability.tracing import TracingLogger
+
+logger = TracingLogger(__name__)
 
 
 class SQLExecutor:
@@ -37,6 +42,7 @@ class SQLExecutor:
         pool: Pool,
         security_config: SecurityConfig,
         db_config: DatabaseConfig,
+        metrics: MetricsCollector | None = None,
     ) -> None:
         """Initialize SQL executor.
 
@@ -44,10 +50,12 @@ class SQLExecutor:
             pool: asyncpg connection pool for database connections.
             security_config: Security configuration including timeouts and limits.
             db_config: Database configuration including connection parameters.
+            metrics: Optional metrics collector for observability.
         """
         self.pool = pool
         self.security_config = security_config
         self.db_config = db_config
+        self.metrics = metrics
 
     async def execute(
         self,
@@ -91,6 +99,9 @@ class SQLExecutor:
         timeout = timeout or self.security_config.max_execution_time
         max_rows = max_rows or self.security_config.max_rows
 
+        # Record start time for metrics
+        start_time = datetime.datetime.now()
+
         try:
             async with (
                 self.pool.acquire() as connection,
@@ -126,6 +137,12 @@ class SQLExecutor:
 
                 # Serialize special PostgreSQL types
                 results = self._serialize_results(results)
+                
+                execution_time = (datetime.datetime.now() - start_time).total_seconds()
+                if self.metrics:
+                    self.metrics.observe_db_query_duration(execution_time)
+                    # Note: get_size() might not be available on all pool implementations or might be costly
+                    # self.metrics.set_db_pool_size(self.pool.get_size()) 
 
                 return results, total_count
 

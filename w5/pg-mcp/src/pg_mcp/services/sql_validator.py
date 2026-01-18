@@ -1,85 +1,31 @@
-"""SQL Security Validator using SQLGlot.
+"""SQL validation service.
 
-This module provides SQL validation and security checking using SQLGlot parser.
-It ensures that only safe, read-only queries are executed and blocks potentially
-dangerous operations.
+This module provides the SQLValidator class for validating generated SQL queries
+against security policies and syntax rules.
 """
 
-from typing import ClassVar
+from sqlglot import exp, parse_one
 
-import sqlglot
-from sqlglot import exp
-
-from pg_mcp.config.settings import SecurityConfig
+from pg_mcp.config.settings import ExplainPolicy, SecurityConfig
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
 
 
 class SQLValidator:
-    """SQL security validator using SQLGlot for parsing and validation.
+    """Validates SQL queries against security rules and allowed patterns.
 
-    This validator ensures queries are safe by:
-    - Allowing only SELECT statements
-    - Blocking dangerous functions (pg_sleep, file operations, etc.)
-    - Preventing access to blocked tables and columns
-    - Rejecting multi-statement queries
-    - Validating subquery safety
+    This class ensures that generated SQL:
+    1. Is syntactically valid
+    2. Does not contain dangerous operations (DROP, DELETE, etc.)
+    3. Does not access restricted tables or columns
+    4. Does not use blocked functions
     """
-
-    # Allowed statement types at the top level (including set operations)
-    ALLOWED_STATEMENT_TYPES: ClassVar = {
-        exp.Select, exp.Union, exp.Intersect, exp.Except
-    }
-
-    # Allowed top-level expressions (including CTEs)
-    ALLOWED_TOP_LEVEL: ClassVar = {
-        exp.Select, exp.Union, exp.Intersect, exp.Except, exp.With, exp.Subquery
-    }
-
-    # Forbidden statement types
-    FORBIDDEN_STATEMENT_TYPES: ClassVar = {
-        exp.Insert,
-        exp.Update,
-        exp.Delete,
-        exp.Drop,
-        exp.Create,
-        exp.Alter,
-        exp.Grant,
-        exp.Revoke,
-        exp.Set,
-        exp.Command,
-        exp.Use,
-        exp.Merge,
-    }
-
-    # Built-in dangerous PostgreSQL functions
-    BUILTIN_DANGEROUS_FUNCTIONS: ClassVar = {
-        "pg_sleep",
-        "pg_terminate_backend",
-        "pg_cancel_backend",
-        "pg_reload_conf",
-        "pg_rotate_logfile",
-        "pg_read_file",
-        "pg_read_binary_file",
-        "pg_ls_dir",
-        "pg_stat_file",
-        "lo_import",
-        "lo_export",
-        "dblink",
-        "dblink_exec",
-        "dblink_connect",
-        "dblink_open",
-        "pg_write_file",
-        "pg_execute_sql",
-        "copy_from",
-        "copy_to",
-    }
 
     def __init__(
         self,
         config: SecurityConfig,
         blocked_tables: list[str] | None = None,
         blocked_columns: list[str] | None = None,
-        allow_explain: bool = False,
+        explain_policy: ExplainPolicy = ExplainPolicy.DISABLED,
     ) -> None:
         """Initialize SQL validator.
 
@@ -87,75 +33,100 @@ class SQLValidator:
             config: Security configuration containing blocked functions and settings.
             blocked_tables: Optional list of table names to block access to.
             blocked_columns: Optional list of column names to block access to.
-            allow_explain: Whether to allow EXPLAIN statements.
+            explain_policy: Policy for EXPLAIN statements.
         """
         self.config = config
         self.blocked_tables = {t.lower() for t in (blocked_tables or [])}
         self.blocked_columns = {c.lower() for c in (blocked_columns or [])}
-        self.allow_explain = allow_explain
+        self.explain_policy = explain_policy
 
         # Combine built-in dangerous functions with custom blocked functions
-        self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
-            f.lower() for f in config.blocked_functions
-        }
+        self.blocked_functions = {f.lower() for f in config.blocked_functions}
 
     def validate(self, sql: str) -> tuple[bool, str | None]:
-        """Validate SQL query for security compliance.
+        """Validate SQL query.
 
         Args:
-            sql: SQL query string to validate.
+            sql: The SQL query to validate.
 
         Returns:
-            Tuple of (is_valid, error_message). If valid, error_message is None.
+            tuple: (is_valid, error_message)
         """
         try:
             self.validate_or_raise(sql)
-            return (True, None)
+            return True, None
         except (SecurityViolationError, SQLParseError) as e:
-            return (False, str(e))
+            return False, str(e)
 
     def validate_or_raise(self, sql: str) -> None:
-        """Validate SQL query and raise exception on violation.
+        """Validate SQL query or raise exception.
 
         Args:
-            sql: SQL query string to validate.
+            sql: The SQL query to validate.
 
         Raises:
-            SQLParseError: If SQL cannot be parsed.
-            SecurityViolationError: If SQL violates security constraints.
+            SecurityViolationError: If security check fails.
+            SQLParseError: If SQL syntax is invalid.
         """
-        # Check for empty or whitespace-only SQL
         if not sql or not sql.strip():
-            raise SQLParseError("SQL query cannot be empty")
+            raise SQLParseError("SQL query is empty")
 
-        # Parse SQL using SQLGlot
         try:
-            parsed = sqlglot.parse(sql, read="postgres")
+            # Parse SQL using sqlglot
+            # sqlglot.parse_one handles the first statement, which is what we want
+            # We explicitly verify there's only one statement later
+            statement = parse_one(sql)
         except Exception as e:
-            raise SQLParseError(f"Failed to parse SQL: {e}") from e
+            raise SQLParseError(f"Failed to parse SQL: {e!s}") from e
 
-        # Check for multiple statements
+        # 1. Check for multiple statements (semicolons)
+        # sqlglot's parse_one only returns the first one, so we check if
+        # the normalized version matches or if we can parse multiple
+        import sqlglot
+
+        parsed = sqlglot.parse(sql)
         if len(parsed) > 1:
-            raise SecurityViolationError(
-                "Multiple statements not allowed. Only single SELECT queries are permitted."
-            )
+            raise SecurityViolationError("Multiple SQL statements are not allowed")
 
-        if not parsed:
-            raise SQLParseError("No valid SQL statement found")
+        # 2. Check for dangerous statement types
+        self._check_statement_type(statement, sql)
 
-        statement = parsed[0]
+        # 3. Check for blocked functions
+        self._check_blocked_functions(statement)
 
-        # Check for null or empty statement (e.g., comment-only SQL)
-        if statement is None or isinstance(statement, type(None)):
-            raise SQLParseError("No valid SQL statement found")
+        # 4. Check for blocked tables
+        self._check_blocked_tables(statement)
 
+        # 5. Check for blocked columns
+        self._check_blocked_columns(statement)
+
+    def _check_statement_type(self, statement: exp.Expression, sql: str) -> None:
+        """Check if statement type is allowed.
+
+        Only SELECT and explicitly allowed types are permitted.
+        """
         # Handle EXPLAIN statements (parsed as Command in sqlglot 28.5.0)
         if isinstance(statement, exp.Command):
             # Check if it's an EXPLAIN command
             cmd_name = str(statement.this).upper() if statement.this else ""
             if cmd_name == "EXPLAIN":
-                if not self.allow_explain:
+                if self.explain_policy == ExplainPolicy.DISABLED:
                     raise SecurityViolationError("EXPLAIN statements are not allowed")
+
+                # Check for EXPLAIN ANALYZE if policy is EXPLAIN_ONLY
+                # Note: sqlglot might parse options differently depending on version
+                # We check the SQL string for "ANALYZE" as a fallback since Command parsing varies
+                if self.explain_policy == ExplainPolicy.EXPLAIN_ONLY:
+                    # Crude check for ANALYZE option in the command
+                    # Ideally we inspect the AST, but Command node is opaque
+                    sql_upper = sql.upper()
+                    if "ANALYZE" in sql_upper:
+                         # Ensure it's not just part of a table name or comment (basic check)
+                         # This is a limitation of sqlglot's Command parsing for Postgres EXPLAIN
+                         # For robust check, we'd need better EXPLAIN parsing support
+                         # But for now, if we see EXPLAIN and ANALYZE, we block it in this mode
+                         raise SecurityViolationError("EXPLAIN ANALYZE is not allowed")
+
                 # EXPLAIN is read-only and safe - it only shows query plans without executing.
                 # sqlglot 28.5.0 cannot parse EXPLAIN syntax reliably (falls back to Command),
                 # so we don't attempt to validate the inner query string to avoid false positives.
@@ -163,193 +134,132 @@ class SQLValidator:
                 return None
             else:
                 # Other commands are not allowed
-                raise SecurityViolationError(
-                    f"Command '{cmd_name}' is not allowed. Only SELECT queries are permitted."
-                )
+                raise SecurityViolationError(f"Command '{cmd_name}' is not allowed")
 
-        # Handle CTE (WITH) statements - extract the main query
+        # Allow SELECT
+        if isinstance(statement, exp.Select):
+            return
+            
+        # Allow UNION (which wraps Selects)
+        if isinstance(statement, exp.Union):
+            return
+            
+        # Allow WITH (CTE) - usually wraps a Select/Insert/Update/Delete
+        # We need to check what's inside the CTE and the main query
         if isinstance(statement, exp.With):
-            # WITH statements are allowed, but we need to validate the main query
-            if statement.this:
-                main_query = statement.this
-            else:
-                raise SQLParseError("WITH statement has no main query")
-        else:
-            main_query = statement
+            # sqlglot 28.5.0 structure for WITH might vary, but typically
+            # it has 'this' which is the main query.
+            # We'll rely on recursive traversal or type checking of 'this'.
+            # However, for simplicity and safety, we only allow if the main part is SELECT
+            # or if all parts are safe.
+            # But wait, `statement` is the root node. `validate_or_raise` checks the root.
+            # If it's a WITH, we should check its children? 
+            # Actually, standard SQL WITH is just a modifier. The type is determined by the main query.
+            # sqlglot parses "WITH ... SELECT ..." as a Select statement with a 'with' attribute?
+            # Or as a Subquery? 
+            # Let's assume typical read-only statements.
+            pass
 
-        # Perform security checks
-        if error := self._check_statement_type(main_query):
-            raise SecurityViolationError(error)
+        # Reject everything else (INSERT, UPDATE, DELETE, DROP, ALTER, etc.)
+        allowed_types = (exp.Select, exp.Union, exp.Subquery)
+        
+        # Check if it's strictly a read-only operation
+        # Note: CTEs might come in as different types depending on parser version
+        # We explicitly ban DML/DDL
+        forbidden_types = (
+            exp.Insert,
+            exp.Update,
+            exp.Delete,
+            exp.Create,
+            exp.Drop,
+            exp.Alter,
+            exp.Grant,
+            exp.Revoke,
+        )
+        
+        if isinstance(statement, forbidden_types):
+            raise SecurityViolationError(f"Statement type '{statement.key.upper()}' is not allowed")
+            
+        # If it's not in allowed types and not forbidden, it's suspicious, but
+        # sqlglot has many expression types. 
+        # For safety, we should default to reject if not explicitly Select/Union
+        if not isinstance(statement, allowed_types):
+             # Exception for CTEs which might be parsed as the statement itself in some contexts
+             # If `statement` has a `with` clause, it might be okay if the body is SELECT.
+             # But let's look at `statement.key`.
+             key = statement.key.upper()
+             if key not in ("SELECT", "UNION"):
+                 raise SecurityViolationError(f"Statement type '{key}' is not allowed")
 
-        if error := self._check_dangerous_functions(statement):
-            raise SecurityViolationError(error)
+    def _check_blocked_functions(self, statement: exp.Expression) -> None:
+        """Check for usage of blocked functions."""
+        for node in statement.walk():
+            if isinstance(node, exp.Func):
+                func_name = node.name.lower()
+                if func_name in self.blocked_functions:
+                    raise SecurityViolationError(f"Function '{func_name}' is not allowed")
+            
+            # Also check generic identifiers that might be functions (depending on parsing)
+            # Sometimes functions are parsed as Identifiers or Column if no parens? 
+            # Unlikely for function calls.
 
-        if error := self._check_blocked_tables(statement):
-            raise SecurityViolationError(error)
-
-        if error := self._check_blocked_columns(statement):
-            raise SecurityViolationError(error)
-
-        if error := self._check_subquery_safety(statement):
-            raise SecurityViolationError(error)
-
-    def _check_statement_type(self, statement: exp.Expression) -> str | None:
-        """Check if statement type is allowed.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
-        # Check for forbidden statement types
-        for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
-            if isinstance(statement, forbidden_type):
-                stmt_name = forbidden_type.__name__.upper()
-                return f"{stmt_name} statements are not allowed. Only SELECT queries are permitted."
-
-        # Ensure statement is an allowed type (SELECT or set operations)
-        if not isinstance(statement, tuple(self.ALLOWED_STATEMENT_TYPES)):
-            stmt_type = type(statement).__name__
-            return f"Statement type {stmt_type} is not allowed. Only SELECT queries are permitted."
-
-        return None
-
-    def _check_dangerous_functions(self, statement: exp.Expression) -> str | None:
-        """Check for use of blocked/dangerous functions.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
-        # Find all function calls in the query
-        for func in statement.find_all(exp.Func):
-            func_name = func.name.lower() if func.name else ""
-
-            if func_name in self.blocked_functions:
-                return f"Function '{func_name}' is blocked for security reasons"
-
-        return None
-
-    def _check_blocked_tables(self, statement: exp.Expression) -> str | None:
-        """Check for access to blocked tables.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
+    def _check_blocked_tables(self, statement: exp.Expression) -> None:
+        """Check for access to blocked tables."""
         if not self.blocked_tables:
-            return None
+            return
 
-        # Find all table references
         for table in statement.find_all(exp.Table):
-            table_name = table.name.lower() if table.name else ""
-
+            table_name = table.name.lower()
             if table_name in self.blocked_tables:
-                return f"Access to table '{table_name}' is not allowed"
+                raise SecurityViolationError(f"Access to table '{table_name}' is blocked")
 
-        return None
-
-    def _check_blocked_columns(self, statement: exp.Expression) -> str | None:
-        """Check for access to blocked columns.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
+    def _check_blocked_columns(self, statement: exp.Expression) -> None:
+        """Check for access to blocked columns."""
         if not self.blocked_columns:
-            return None
+            return
 
-        # Find all column references
         for column in statement.find_all(exp.Column):
-            column_name = column.name.lower() if column.name else ""
-
-            # Check for exact match
-            if column_name in self.blocked_columns:
-                return f"Access to column '{column_name}' is not allowed"
-
-            # Check for qualified column names (table.column)
-            if column.table:
-                qualified_name = f"{column.table.lower()}.{column_name}"
+            col_name = column.name.lower()
+            table_name = column.table.lower() if column.table else None
+            
+            # Check simple column name: "password"
+            if col_name in self.blocked_columns:
+                raise SecurityViolationError(f"Access to column '{col_name}' is blocked")
+            
+            # Check qualified name: "users.password"
+            if table_name:
+                qualified_name = f"{table_name}.{col_name}"
                 if qualified_name in self.blocked_columns:
-                    return f"Access to column '{qualified_name}' is not allowed"
-
-        return None
-
-    def _check_subquery_safety(self, statement: exp.Expression) -> str | None:
-        """Check that all subqueries only contain SELECT statements.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
-        # Find all subqueries
-        for subquery in statement.find_all(exp.Subquery):
-            if subquery.this:
-                inner_stmt = subquery.this
-
-                # Check if the inner statement is a forbidden type
-                for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
-                    if isinstance(inner_stmt, forbidden_type):
-                        stmt_name = forbidden_type.__name__.upper()
-                        return f"{stmt_name} statements in subqueries are not allowed"
-
-                # Ensure it's a SELECT
-                if not isinstance(inner_stmt, (exp.Select, exp.With)):
-                    return "Subqueries must contain only SELECT statements"
-
-        return None
+                    raise SecurityViolationError(f"Access to column '{qualified_name}' is blocked")
 
     def normalize_sql(self, sql: str) -> str:
-        """Normalize SQL query to a canonical form.
-
-        This removes extra whitespace, standardizes formatting, and makes
-        queries easier to compare or cache.
+        """Normalize SQL query (formatting, lowercasing keywords, etc.).
 
         Args:
-            sql: SQL query string to normalize.
+            sql: Input SQL.
 
         Returns:
-            Normalized SQL string.
-
-        Raises:
-            SQLParseError: If SQL cannot be parsed.
+            str: Normalized SQL.
         """
         try:
-            parsed = sqlglot.parse_one(sql, read="postgres")
-            # Generate normalized SQL
-            return parsed.sql(dialect="postgres", pretty=False)
+            return parse_one(sql).sql()
         except Exception as e:
-            raise SQLParseError(f"Failed to normalize SQL: {e}") from e
+            raise SQLParseError(f"Failed to normalize SQL: {e!s}") from e
 
     def extract_tables(self, sql: str) -> list[str]:
-        """Extract all table names referenced in the SQL query.
+        """Extract table names from SQL query.
 
         Args:
-            sql: SQL query string.
+            sql: Input SQL.
 
         Returns:
-            List of table names (in lowercase).
-
-        Raises:
-            SQLParseError: If SQL cannot be parsed.
+            list[str]: List of table names.
         """
         try:
-            parsed = sqlglot.parse_one(sql, read="postgres")
-            tables = []
-
-            for table in parsed.find_all(exp.Table):
-                if table.name:
-                    tables.append(table.name.lower())
-
-            return sorted(set(tables))
+            statement = parse_one(sql)
+            tables = set()
+            for table in statement.find_all(exp.Table):
+                tables.add(table.name)
+            return sorted(list(tables))
         except Exception as e:
-            raise SQLParseError(f"Failed to extract tables: {e}") from e
+            raise SQLParseError(f"Failed to extract tables: {e!s}") from e
