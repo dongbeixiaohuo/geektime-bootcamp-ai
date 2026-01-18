@@ -108,7 +108,7 @@ class SchemaIntrospector:
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relkind = 'r'  -- regular tables only
-              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+              AND n.nspname = 'public'  -- Only load public schema to improve performance
             ORDER BY n.nspname, c.relname
         """
 

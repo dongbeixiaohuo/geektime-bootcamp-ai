@@ -39,6 +39,7 @@ async def create_pool(config: DatabaseConfig) -> Pool:
         max_size=config.max_pool_size,
         timeout=config.pool_timeout,
         command_timeout=config.command_timeout,
+        statement_cache_size=0,  # Disable prepared statements for Supabase transaction mode
     )
 
     if pool is None:

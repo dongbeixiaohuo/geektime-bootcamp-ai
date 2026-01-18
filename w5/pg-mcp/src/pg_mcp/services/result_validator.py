@@ -53,10 +53,17 @@ class ResultValidator:
         """
         self.openai_config = openai_config
         self.validation_config = validation_config
-        self.client = AsyncOpenAI(
-            api_key=openai_config.api_key.get_secret_value(),
-            timeout=validation_config.timeout_seconds,
-        )
+        if openai_config.base_url:
+            self.client = AsyncOpenAI(
+                api_key=openai_config.api_key.get_secret_value(),
+                timeout=validation_config.timeout_seconds,
+                base_url=openai_config.base_url,
+            )
+        else:
+            self.client = AsyncOpenAI(
+                api_key=openai_config.api_key.get_secret_value(),
+                timeout=validation_config.timeout_seconds,
+            )
 
     async def validate(
         self,

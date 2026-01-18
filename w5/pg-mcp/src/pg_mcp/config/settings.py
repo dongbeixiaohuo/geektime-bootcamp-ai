@@ -7,8 +7,34 @@ sensible defaults.
 
 from typing import Literal
 
+import os
+from pathlib import Path
+
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _load_env_from_dotenv() -> None:
+    env_path = Path(".env")
+    if not env_path.is_file():
+        return
+    content = env_path.read_text(encoding="utf-8")
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        
+        # Load DATABASE_ and OPENAI_ variables if not present in os.environ
+        if (key.startswith("OPENAI_") or key.startswith("DATABASE_")) and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_from_dotenv()
 
 
 class DatabaseConfig(BaseSettings):
@@ -49,13 +75,17 @@ class OpenAIConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENAI_")
 
     api_key: SecretStr = Field(default=SecretStr(""), description="OpenAI API key")
-    model: str = Field(default="gpt-4o-mini", description="Model to use for SQL generation")
-    max_tokens: int = Field(default=2000, ge=100, le=4096, description="Maximum tokens in response")
+    model: str = Field(default="model-router", description="Model to use for SQL generation")
+    max_tokens: int = Field(default=32000, ge=100, le=128000, description="Maximum tokens in response")
     temperature: float = Field(
         default=0.0, ge=0.0, le=2.0, description="Temperature for response randomness"
     )
     timeout: float = Field(
         default=30.0, ge=5.0, le=120.0, description="API request timeout in seconds"
+    )
+    base_url: str | None = Field(
+        default=None,
+        description="Custom OpenAI API base URL (e.g. https://api.example.com/v1)",
     )
 
     @field_validator("api_key")

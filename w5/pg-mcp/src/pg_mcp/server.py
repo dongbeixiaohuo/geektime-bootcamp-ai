@@ -72,7 +72,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
     global _circuit_breaker, _rate_limiter
 
     logger.info("Starting PostgreSQL MCP Server initialization...")
-
+    
     try:
         # 1. Load Settings
         logger.info("Loading configuration...")
@@ -85,6 +85,13 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             log_format=_settings.observability.log_format,
             enable_sensitive_filter=True,
         )
+        
+        # Force file logging for debugging (Re-add after configure_logging cleared it)
+        import logging
+        file_handler = logging.FileHandler("mcp_debug.log", encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(file_handler)
+        logging.getLogger().setLevel(logging.DEBUG)
 
         logger.info(
             "Configuration loaded",
@@ -112,15 +119,17 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         logger.info("Initializing schema cache...")
         _schema_cache = SchemaCache(_settings.cache)
 
-        for db_name, pool in _pools.items():
-            logger.info(f"Loading schema for database '{db_name}'...")
-            schema = await _schema_cache.load(db_name, pool)
-            logger.info(
-                f"Schema loaded for '{db_name}'",
-                extra={
-                    "tables": len(schema.tables),
-                },
-            )
+        # Skip schema loading during startup to prevent timeout
+        logger.info("Skipping initial schema loading to improve startup time...")
+        # for db_name, pool in _pools.items():
+        #     logger.info(f"Loading schema for database '{db_name}'...")
+        #     schema = await _schema_cache.load(db_name, pool)
+        #     logger.info(
+        #         f"Schema loaded for '{db_name}'",
+        #         extra={
+        #             "tables": len(schema.tables),
+        #         },
+        #     )
 
         # Optional: Start schema auto-refresh
         # Disabled by default to avoid unnecessary background tasks
